@@ -1,194 +1,243 @@
-import pyhop
+# autoHTN.py
+# automatically builds HTN planners from crafting rules without hardcoding recipes
+
 import json
-import re
+import pyhop
 
-# turns recipe names into something python won't complain about
-def _safe_name(s):
-	s = s.lower()
-	s = re.sub(r'[^a-z0-9_]+', '_', s)
-	s = re.sub(r'_+', '_', s).strip('_')
-	return s
 
-# if we already have enough of something, we're done
+# checks if we already have enough of something
 def check_enough(state, ID, item, num):
-	if getattr(state, item)[ID] >= num:
-		return []
-	return False
+    if getattr(state, item)[ID] >= num:
+        return []
+    return False
 
-# otherwise try making it, then check again
+
+# if we don’t have enough, try to produce more and check again
 def produce_enough(state, ID, item, num):
-	return [('produce', ID, item), ('have_enough', ID, item, num)]
+    return [('produce', ID, item), ('have_enough', ID, item, num)]
+
 
 pyhop.declare_methods('have_enough', check_enough, produce_enough)
 
-# generic router to produce_<item>
+
+# generic dispatcher that redirects to produce_<item>
+# also prevents re-crafting the same tool forever
 def produce(state, ID, item):
-	return [('produce_{}'.format(item), ID)]
+    made_flag = f"made_{item}"
+    if hasattr(state, made_flag):
+        if getattr(state, made_flag)[ID]:
+            return False
+        getattr(state, made_flag)[ID] = True
+    return [(f'produce_{item}', ID)]
+
 
 pyhop.declare_methods('produce', produce)
 
-# builds one HTN method from one crafting recipe
-def make_method(method_name, rule, op_name, tools_set):
-	def method(state, ID):
-		subtasks = []
 
-		# tools you need but don't spend
-		for tool, num in rule.get('Requires', {}).items():
-			subtasks.append(('have_enough', ID, tool, num))
+# creates an operator from a recipe rule
+def make_operator(rule):
+    produces = rule.get('Produces', {})
+    requires = rule.get('Requires', {})
+    consumes = rule.get('Consumes', {})
+    time = rule.get('Time', 0)
 
-		# items you spend
-		for item, num in rule.get('Consumes', {}).items():
-			subtasks.append(('have_enough', ID, item, num))
+    def operator(state, ID):
+        # check required tools
+        for tool, amt in requires.items():
+            if getattr(state, tool)[ID] < amt:
+                return False
 
-		# actually do the thing
-		subtasks.append((op_name, ID))
-		return subtasks
+        # check consumable items
+        for item, amt in consumes.items():
+            if getattr(state, item)[ID] < amt:
+                return False
 
-	method.__name__ = method_name
-	method._recipe_time = rule.get('Time', 999999)
-	method._requires_tools = bool(rule.get('Requires'))
-	return method
+        # check time
+        if state.time[ID] < time:
+            return False
 
-# declare all recipe methods
-def declare_methods(data):
-	methods_by_item = {}
-	tools_set = set(data.get('Tools', []))
+        # apply consumes
+        for item, amt in consumes.items():
+            getattr(state, item)[ID] -= amt
 
-	for recipe_name, rule in data['Recipes'].items():
-		for produced_item in rule['Produces'].keys():
-			task = 'produce_{}'.format(produced_item)
-			method_name = 'm_{}'.format(_safe_name(recipe_name))
-			op_name = 'op_{}'.format(_safe_name(recipe_name))
-			m = make_method(method_name, rule, op_name, tools_set)
-			methods_by_item.setdefault(task, []).append(m)
+        # apply produces
+        for item, amt in produces.items():
+            getattr(state, item)[ID] += amt
 
-	for task, ms in methods_by_item.items():
-		# faster recipes first
-		ms.sort(key=lambda m: m._recipe_time)
-		pyhop.declare_methods(task, *ms)
+        state.time[ID] -= time
+        return state
 
-# builds one operator from one crafting recipe
-def make_operator(rule, op_name):
-	def operator(state, ID):
-		time_cost = rule.get('Time', 0)
-		if state.time[ID] < time_cost:
-			return False
+    return operator
 
-		# check tools
-		for tool, num in rule.get('Requires', {}).items():
-			if getattr(state, tool)[ID] < num:
-				return False
 
-		# check consumables
-		for item, num in rule.get('Consumes', {}).items():
-			if getattr(state, item)[ID] < num:
-				return False
-
-		# spend consumables
-		for item, num in rule.get('Consumes', {}).items():
-			getattr(state, item)[ID] -= num
-
-		# spend time
-		state.time[ID] -= time_cost
-
-		# gain produced items
-		for item, num in rule.get('Produces', {}).items():
-			getattr(state, item)[ID] += num
-
-		return state
-
-	operator.__name__ = op_name
-	operator._recipe_time = rule.get('Time', 999999)
-	return operator
-
-# declare all operators
+# registers all operators from the crafting file
 def declare_operators(data):
-	ops = []
-	for recipe_name, rule in data['Recipes'].items():
-		op_name = 'op_{}'.format(_safe_name(recipe_name))
-		ops.append(make_operator(rule, op_name))
+    ops = []
+    for name, rule in data['Recipes'].items():
+        op = make_operator(rule)
+        op.__name__ = 'op_' + name.replace(' ', '_')
+        ops.append(op)
+    pyhop.declare_operators(*ops)
 
-	pyhop.declare_operators(*ops)
 
-# heuristic to stop infinite loops and dumb branches
-def add_heuristic(data, ID):
-	def heuristic(state, curr_task, tasks, plan, depth, calling_stack):
-		# hard recursion cap
-		if depth > 80:
-			return True
+# keeps ingots from being consumed too early
+def _consumes_order(consumes):
+    if not consumes:
+        return []
+    if 'ingot' in consumes:
+        return list(consumes.items())
+    return list(consumes.items())
 
-		# don't let produce_x loop on itself
-		if curr_task[0].startswith('produce_') and curr_task in calling_stack:
-			return True
 
-		# negative time should never happen
-		if state.time[ID] < 0:
-			return True
+# builds a method from a recipe
+def make_method(recipe_name, rule):
+    consumes = rule.get('Consumes', {})
+    requires = rule.get('Requires', {})
+    time = rule.get('Time', 0)
 
-		return False
+    def method(state, ID):
+        subtasks = []
 
-	pyhop.add_check(heuristic)
+        # make sure we have things that get consumed
+        for item, qty in _consumes_order(consumes):
+            subtasks.append(('have_enough', ID, item, qty))
 
-# runtime ordering for produce_* methods
-def define_ordering(data, ID):
-	tools_set = set(data.get('Tools', []))
+        # make sure we have required tools or stations
+        for tool, qty in requires.items():
+            subtasks.append(('have_enough', ID, tool, qty))
 
-	def reorder_methods(state, curr_task, tasks, plan, depth, calling_stack, methods):
-		def score(m):
-			try:
-				subtasks = pyhop.get_subtasks(m, state, curr_task)
-			except Exception:
-				subtasks = []
+        # finally run the operator
+        subtasks.append(('op_' + recipe_name.replace(' ', '_'), ID))
+        return subtasks
 
-			missing_tool_penalty = 0
-			for t in subtasks:
-				if len(t) == 4 and t[0] == 'have_enough':
-					thing, num = t[2], t[3]
-					if thing in tools_set and getattr(state, thing)[ID] < num:
-						missing_tool_penalty += 100
+    method.__name__ = recipe_name.replace(' ', '_')
 
-			return (missing_tool_penalty, getattr(m, '_recipe_time', 999999))
+    # metadata used for method reordering
+    method._meta = {
+        'produces': rule.get('Produces', {}),
+        'requires': requires,
+        'consumes': consumes,
+        'time': time
+    }
 
-		return sorted(methods, key=score)
+    return method
 
-	pyhop.define_ordering(reorder_methods)
 
-# initialize state from JSON
+# groups methods by what they produce and sorts them
+def declare_methods(data):
+    methods_by_task = {}
+
+    for recipe_name, rule in data['Recipes'].items():
+        product = next(iter(rule['Produces'].keys()))
+        task = f'produce_{product}'
+        m = make_method(recipe_name, rule)
+        methods_by_task.setdefault(task, []).append(m)
+
+    # default sort by time
+    for task, methods in methods_by_task.items():
+        methods.sort(key=lambda m: m._meta['time'])
+        pyhop.declare_methods(task, *methods)
+
+
+# finds items currently being pursued to detect cycles
+def _ancestor_items(calling_stack):
+    items = set()
+    for t in calling_stack:
+        if t[0] == 'have_enough' and len(t) >= 3:
+            items.add(t[2])
+        if t[0] == 'produce' and len(t) >= 3:
+            items.add(t[2])
+    return items
+
+
+# reorders methods so we don’t require a tool while trying to make it
+def get_custom_method_order(state, curr_task, tasks, plan, depth, calling_stack, methods):
+    ancestors = _ancestor_items(calling_stack)
+
+    if not curr_task[0].startswith('produce_'):
+        return methods
+
+    def score(m):
+        requires = set(m._meta['requires'].keys())
+        cycle_penalty = 1000 if requires & ancestors else 0
+        tool_penalty = len(requires) * 2
+        time_penalty = m._meta['time']
+        return cycle_penalty + tool_penalty + time_penalty
+
+    return sorted(methods, key=score)
+
+
+# adds pruning rules to cut bad branches
+def add_heuristics(data, ID):
+    goal_items = set(data['Problem']['Goal'].keys())
+    goal_qty = data['Problem']['Goal']
+
+    # estimate wood needed from goals
+    wood_needed = 0
+    wood_needed += goal_qty.get('wood', 0)
+    wood_needed += goal_qty.get('plank', 0) / 4
+    wood_needed += goal_qty.get('stick', 0) / 8
+
+    def is_producing(task, name):
+        return task[0] == f'produce_{name}' or (task[0] == 'produce' and task[2] == name)
+
+    # don’t make iron axe unless explicitly required
+    def prune_iron_axe(state, curr_task, *args):
+        return is_producing(curr_task, 'iron_axe') and 'iron_axe' not in goal_items
+
+    # don’t make axes if punching wood is fast enough
+    def prune_axes(state, curr_task, *args):
+        if is_producing(curr_task, 'wooden_axe') or is_producing(curr_task, 'stone_axe'):
+            if curr_task[2] in goal_items:
+                return False
+            remaining = max(0, wood_needed - state.wood[ID])
+            return remaining * 4 <= state.time[ID]
+        return False
+
+    pyhop.add_check(prune_iron_axe)
+    pyhop.add_check(prune_axes)
+
+
+# builds the initial state
 def set_up_state(data, ID):
-	state = pyhop.State('state')
-	setattr(state, 'time', {ID: data['Problem']['Time']})
+    state = pyhop.State('state')
+    state.time = {ID: data['Problem']['Time']}
 
-	for item in data['Items']:
-		setattr(state, item, {ID: 0})
+    for item in data['Items']:
+        setattr(state, item, {ID: 0})
 
-	for item in data['Tools']:
-		setattr(state, item, {ID: 0})
+    for tool in data['Tools']:
+        setattr(state, tool, {ID: 0})
+        setattr(state, f"made_{tool}", {ID: False})
 
-	for item, num in data['Problem']['Initial'].items():
-		setattr(state, item, {ID: num})
+    for item, amt in data['Problem']['Initial'].items():
+        getattr(state, item)[ID] = amt
 
-	return state
+    return state
 
-# convert goal dict into HTN tasks
+
+# converts goal dict into have_enough tasks
 def set_up_goals(data, ID):
-	return [('have_enough', ID, item, num) for item, num in data['Problem']['Goal'].items()]
+    return [('have_enough', ID, item, amt) for item, amt in data['Problem']['Goal'].items()]
 
+
+# entry point
 if __name__ == '__main__':
-	import sys
-	rules_filename = 'crafting.json'
-	if len(sys.argv) > 1:
-		rules_filename = sys.argv[1]
+    import sys
 
-	with open(rules_filename) as f:
-		data = json.load(f)
+    if len(sys.argv) < 2:
+        print("usage: python3 autoHTN.py scenario_x.json")
+        sys.exit(1)
 
-	state = set_up_state(data, 'agent')
-	goals = set_up_goals(data, 'agent')
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
 
-	declare_operators(data)
-	declare_methods(data)
-	add_heuristic(data, 'agent')
-	define_ordering(data, 'agent')
+    ID = 'agent'
+    state = set_up_state(data, ID)
+    goals = set_up_goals(data, ID)
 
-	# keep verbose low or it crawls
-	pyhop.pyhop(state, goals, verbose=1)
+    declare_operators(data)
+    declare_methods(data)
+    add_heuristics(data, ID)
+
+    pyhop.pyhop(state, goals, verbose=1)

@@ -1,10 +1,12 @@
 {
-"Problem": {
-  "Time": 300,
-  "Initial": {},
-  "Goal": { "iron_pickaxe": 1 }
-},
-
+ "Problem": {
+  "Time": 100,
+  "Initial": {
+  },
+  "Goal": {
+    "iron_pickaxe": 1
+  }
+ },
  "Items": [
    "cart",
    "coal",

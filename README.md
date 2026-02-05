@@ -1,0 +1,3 @@
+Explanation of our heuristic:
+
+We noticed that alot of the infinite cycles resulted from unnecessary tool production, especially from axes. As a result, we decided on a simple heuristic that just prunes all branches that attempts to produce an axe since punching wood is sufficient most of the time. In addition to this heuristic, we also reordered our subtasks to have ingot production as the last due to how expensive they are.

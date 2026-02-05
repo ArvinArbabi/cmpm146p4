@@ -139,65 +139,34 @@ def declare_methods(data):
         pyhop.declare_methods(task, *methods)
 
 
-# finds items currently being pursued to detect cycles
-def _ancestor_items(calling_stack):
-    items = set()
-    for t in calling_stack:
-        if t[0] == 'have_enough' and len(t) >= 3:
-            items.add(t[2])
-        if t[0] == 'produce' and len(t) >= 3:
-            items.add(t[2])
-    return items
-
-
-# reorders methods so we don’t require a tool while trying to make it
-def get_custom_method_order(state, curr_task, tasks, plan, depth, calling_stack, methods):
-    ancestors = _ancestor_items(calling_stack)
-
-    if not curr_task[0].startswith('produce_'):
-        return methods
-
-    def score(m):
-        requires = set(m._meta['requires'].keys())
-        cycle_penalty = 1000 if requires & ancestors else 0
-        tool_penalty = len(requires) * 2
-        time_penalty = m._meta['time']
-        return cycle_penalty + tool_penalty + time_penalty
-
-    return sorted(methods, key=score)
-
-
 # adds pruning rules to cut bad branches
 def add_heuristics(data, ID):
-    goal_items = set(data['Problem']['Goal'].keys())
-    goal_qty = data['Problem']['Goal']
+    def heuristic(state, curr_task, tasks, plan, depth, calling_stack):
+        # get the goal
+        goal = set(data["Problem"]["Goal"].keys())
+        item = None
+        
+        # if the current task produces an item, get that item
+        if curr_task[0].startswith("produce_"):
+            item = curr_task[len("produce_"):]
+        elif curr_task[0] == "produce":
+            item = curr_task[2]
 
-    # estimate wood needed from goals
-    wood_needed = 0
-    wood_needed += goal_qty.get('wood', 0)
-    wood_needed += goal_qty.get('plank', 0) / 4
-    wood_needed += goal_qty.get('stick', 0) / 8
-
-    def is_producing(task, name):
-        return task[0] == f'produce_{name}' or (task[0] == 'produce' and task[2] == name)
-
-    # don’t make iron axe unless explicitly required
-    def prune_iron_axe(state, curr_task, *args):
-        return is_producing(curr_task, 'iron_axe') and 'iron_axe' not in goal_items
-
-    # don’t make axes if punching wood is fast enough
-    def prune_axes(state, curr_task, *args):
-        if is_producing(curr_task, 'wooden_axe') or is_producing(curr_task, 'stone_axe'):
-            if curr_task[2] in goal_items:
-                return False
-            remaining = max(0, wood_needed - state.wood[ID])
-            return remaining * 4 <= state.time[ID]
+        # Never make any axes as too much tool production is what leads to the most infinite cycles
+        if item is not None:
+            if item == "iron_axe" and "iron_axe" not in goal:
+                return True
+                
+            if item == "stone_axe" and "stone_axe" not in goal:
+                return True
+                
+            if item == "wooden_axe" and "wooden_axe" not in goal:
+                return True
+            
         return False
-
-    pyhop.add_check(prune_iron_axe)
-    pyhop.add_check(prune_axes)
-
-
+        
+    pyhop.add_check(heuristic)
+        
 # builds the initial state
 def set_up_state(data, ID):
     state = pyhop.State('state')
@@ -224,20 +193,18 @@ def set_up_goals(data, ID):
 # entry point
 if __name__ == '__main__':
     import sys
+    rules_filename = 'crafting.json'
+    if len(sys.argv) > 1:
+        rules_filename = sys.argv[1]
 
-    if len(sys.argv) < 2:
-        print("usage: python3 autoHTN.py scenario_x.json")
-        sys.exit(1)
-
-    with open(sys.argv[1]) as f:
+    with open(rules_filename) as f:
         data = json.load(f)
 
-    ID = 'agent'
-    state = set_up_state(data, ID)
-    goals = set_up_goals(data, ID)
+    state = set_up_state(data, 'agent')
+    goals = set_up_goals(data, 'agent')
 
     declare_operators(data)
     declare_methods(data)
-    add_heuristics(data, ID)
+    add_heuristics(data, 'agent')
 
     pyhop.pyhop(state, goals, verbose=1)
